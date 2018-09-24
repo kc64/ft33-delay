@@ -63,7 +63,7 @@ BusOut lights(P0_23, P0_19, P0_22, P0_18, P0_21, P0_17, P0_20, P0_16);
 /* Setup the dipswitch input port. */
 BusInOut dipswitch(P1_23, P0_12, P0_13, P0_14, P0_7, P0_8, P0_9, P1_24);
 DigitalInOut master_slave(P0_4);
-DigitalInOut test(P0_5);
+DigitalInOut start_delay(P0_5);
 
 /* Setup the reset switch as an input to keep it from being a reset */
 DigitalInOut reset(P0_0);
@@ -75,7 +75,6 @@ float speed;            /* The selected speed for chases. */
 word dimmer_speed = 1;      /* The selected speed for dimming */
 int speed_clks;         /* speed in clocks (1/60th sec). */
 int clocks = 1;             /* Incremented everytime the zero cross interrupt is called. */
-int total_clocks_per_step = 1;
 byte pattern;           /* The current output pattern. */
 byte *ptrSequence;      /* A pointer to the desired sequence. */
 
@@ -83,7 +82,7 @@ word sequenceLength;    /* The length of the desired sequence. */
 word step;              /* The step in the current sequence. */
 char line[100];
 byte master_sequence; 
-byte C = 0;
+byte L = 0;
 byte R = 0;
 byte Z = 0;
 byte MASTER = 0;        // assume slave unless master is enabled
@@ -186,9 +185,14 @@ void master_zcross_isr(void) {
         int_ZCD.fall(NULL);                        // disable the ZCD interrupt otherwise it will trigger on the negative edge also due to some bug. noise?
     }
 
-    clocks--;                                      // a clock is a zero cross (1/60 second)
-    
-    if(clocks == 0) {                              // we need count until clocks rolls over to zero
+    if (clocks > 0)
+        clocks--;
+        
+    if (clocks == 0) {                             // we need count until clocks rolls over to zero
+        for (i = 0; i < ptrDimSequence[step].delay; i++) {
+            wait(potentiometer);
+        }
+        
         step++;
             
         if(step >= sequenceLength) {               // once we step past the end of a sequence, restart the sequence
@@ -198,13 +202,18 @@ void master_zcross_isr(void) {
         else {
             Z = 1;
         }    
-
-        total_clocks_per_step = dimmer_speed * ptrDimSequence[step].ticks;
-        clocks = total_clocks_per_step;
+        clocks = ptrDimSequence[step].ticks * 60;
     }
         
     for(i=0; i<8; i++) {
-        Dimmer[i] = 255 - (ptrDimSequence[step].Chan[i].start + ((ptrDimSequence[step].Chan[i].stop - ptrDimSequence[step].Chan[i].start) * clocks) / total_clocks_per_step);
+        Dimmer[i] = 255 - (
+            ptrDimSequence[step].chan[i].start + (
+                (
+                    ptrDimSequence[step].chan[i].stop - 
+                    ptrDimSequence[step].chan[i].start
+                ) * clocks
+            ) / 20
+        );
     }   
     
     /* Timer for the 255 step dimmer routine. */
@@ -228,8 +237,6 @@ void slave_zcross_isr(void) {
     }
     
     if (R or Z) {
-        total_clocks_per_step = dimmer_speed * ptrDimSequence[step].ticks;
-        clocks = total_clocks_per_step;
         R = 0;
         Z = 0;
     }
@@ -238,7 +245,14 @@ void slave_zcross_isr(void) {
         clocks--;
     
         for(i=0; i<8; i++) {
-            Dimmer[i] = 255 - (ptrDimSequence[step].Chan[i].start + ((ptrDimSequence[step].Chan[i].stop - ptrDimSequence[step].Chan[i].start) * clocks) / total_clocks_per_step);
+            Dimmer[i] = 255 - (
+                ptrDimSequence[step].chan[i].start + (
+                    (
+                        ptrDimSequence[step].chan[i].stop - 
+                        ptrDimSequence[step].chan[i].start
+                    ) * clocks
+                ) / 20
+            );
         }   
     }
     /* Timer for the 255 step dimmer routine. */
@@ -253,6 +267,7 @@ void vfnLoadSequencesFromSD(byte sequence) {
     sDimStep *ptr = NULL;
     SDFileSystem sd(P1_22, P1_21, P1_20, P1_19, "sd"); // the pinout on the FT33 controller
     unsigned int ticks;
+    unsigned int delay;
     unsigned int ChanStart[8];
     unsigned int ChanStop[8];
     unsigned int i;
@@ -264,13 +279,13 @@ void vfnLoadSequencesFromSD(byte sequence) {
         NVIC_SystemReset();
     }
     else {
-        pc.printf("\n");    // in case the "No SD card found" message is sent, be sure to start with a fresh line buffer
+        pc.printf("\nL\n");    // send a load command to the slave
         while(fgets(line, 100, fp) != NULL) {
             pc.printf(line);        // transmit to the slaves
             
             if(line[0] == 'Q') {
                 sscanf(line, "%*s %d %d", &sequence_num, &steps);
-                if(sequence_num == sequence) {
+                if(sequence_num == sequence) {      // if this sequence is the one selected by the switches, save it
                     ptr = (sDimStep *) malloc(sizeof(sDimStep) * steps);
                     if (ptr == NULL) {
                         break;
@@ -280,9 +295,10 @@ void vfnLoadSequencesFromSD(byte sequence) {
                 }
             }
             else if(line[0] == 'S') {
-                if(sequence_num == sequence) {
-                    sscanf(line, "%*s %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                if(sequence_num == sequence) {      // if this sequence is the one selected by the switches, save it
+                    sscanf(line, "%*s %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
                             &ticks,
+                            &delay,
                             &ChanStart[0], &ChanStop[0],
                             &ChanStart[1], &ChanStop[1],
                             &ChanStart[2], &ChanStop[2],
@@ -293,10 +309,11 @@ void vfnLoadSequencesFromSD(byte sequence) {
                             &ChanStart[7], &ChanStop[7]);
 
                     ptr->ticks = (unsigned char)(ticks & 0x000000FF);
+                    ptr->delay = (unsigned char)(delay & 0x000000FF);
                 
                     for (i = 0; i < 8; i++) {
-                        ptr->Chan[i].start = (unsigned char)(ChanStart[i] & 0x000000FF);
-                        ptr->Chan[i].stop  = (unsigned char)(ChanStop[i]  & 0x000000FF);
+                        ptr->chan[i].start = (unsigned char)(ChanStart[i] & 0x000000FF);
+                        ptr->chan[i].stop  = (unsigned char)(ChanStop[i]  & 0x000000FF);
                     }
                     ptr++;
                 }
@@ -324,6 +341,7 @@ void vfnSlaveReceiveData(byte sequence) {
     int step;
     sDimStep *ptr = NULL;
     unsigned int ticks;
+    unsigned int delay;
     unsigned int ChanStart[8];
     unsigned int ChanStop[8];
     unsigned int i;
@@ -334,20 +352,25 @@ void vfnSlaveReceiveData(byte sequence) {
         
         if(line[0] == 'Q') {
             sscanf(line, "%*s %d %d", &sequence_num, &steps);
-            if(sequence_num == sequence) {
-                ptr = (sDimStep *) malloc(sizeof(sDimStep) * steps);
-                if (ptr == NULL) {
-                    break;
+            if(sequence_num == sequence) {      // if this sequence is the one selected by the switches, save it
+                if (L)
+                    ptr = ptrDimSeq;
+                else {
+                    ptr = (sDimStep *) malloc(sizeof(sDimStep) * steps);
+                    if (ptr == NULL) {
+                        break;
+                    }
+                    ptrDimSeq = ptr;
                 }
-                ptrDimSeq = ptr;
                 DimSeqLen = steps;
                 step = 0;
             }
         }
         else if(line[0] == 'S') {
-            if(sequence_num == sequence) {
-                sscanf(line, "%*s %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+            if(sequence_num == sequence) {      // if this sequence is the one selected by the switches, save it
+                sscanf(line, "%*s %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
                         &ticks,
+                        &delay,
                         &ChanStart[0], &ChanStop[0],
                         &ChanStart[1], &ChanStop[1],
                         &ChanStart[2], &ChanStop[2],
@@ -358,10 +381,11 @@ void vfnSlaveReceiveData(byte sequence) {
                         &ChanStart[7], &ChanStop[7]);
 
                 ptr->ticks = (unsigned char)(ticks & 0x000000FF);
+                ptr->delay = (unsigned char)(delay & 0x000000FF);
             
                 for (i = 0; i < 8; i++) {
-                    ptr->Chan[i].start = (unsigned char)(ChanStart[i] & 0x000000FF);
-                    ptr->Chan[i].stop  = (unsigned char)(ChanStop[i]  & 0x000000FF);
+                    ptr->chan[i].start = (unsigned char)(ChanStart[i] & 0x000000FF);
+                    ptr->chan[i].stop  = (unsigned char)(ChanStop[i]  & 0x000000FF);
                 }
                 
                 ptr++;                
@@ -398,14 +422,14 @@ int main() {
     
     //      4-position DIP switch
     //    1       2       3       4
-    //  SLAVE   TEST    WIRED    NOT       ON  ^
+    //  SLAVE   DELAY   WIRED    NOT       ON  ^
     //  MASTR   NORM    RADIO    USED      OFF v
     
     master_slave.mode(PullUp);
     master_slave.input();
 
-    test.mode(PullUp);
-    test.input();
+    start_delay.mode(PullUp);
+    start_delay.input();
 
     int_ZCD.mode(PullUp); 
     
@@ -413,18 +437,10 @@ int main() {
     dipswitch.input();
     sequence = dipswitch.read();
 
-#if 0
-    /* Wait for the XBEE radio to get ready. It takes a while. */
-    for(byte i=0xFF; i>=0xF4; i--) {
-        wait(1.0);
-//        lights = i;
-    }
-#endif
-    
-    if (!test) {
-        while (1) {
-            wait(0.1);
-            lights = potentiometer.read_u16() >> 8;
+    if (!start_delay) {
+        /* Wait for the XBEE radio to get ready. It takes a while. */
+        for(byte i=0xFF; i>=0xF4; i--) {
+            wait(1.0);
         }
     }
     
@@ -470,32 +486,19 @@ int main() {
             ptrDimSequence = ptrDimSeq;
             sequenceLength = DimSeqLen;
             
-            clocks = dimmer_speed;
-            new_pot = potentiometer;
-            old_pot = new_pot;
-
             int_ZCD.fall(&master_zcross_isr);
+
+            clocks = SLOWEST_TIME;
             
             /******************************************************** MASTER DIMMER LOOP ********************************************************/
             while(1) {
-//                Test_RXD = 1;
-                new_pot = potentiometer;
-                if (fabs(old_pot - new_pot) > 0.1) {
-                    old_pot = new_pot;
-                    total_clocks_per_step = dimmer_speed * ptrDimSequence[step].ticks;
-                    clocks = total_clocks_per_step;
-                }
-                dimmer_speed = FASTEST_TIME + (SLOPE * (A_COEFF * exp(B_COEFF * (1.0 - new_pot)) + C_COEFF));
-//                Test_RXD = 0;
+                dimmer_speed = FASTEST_TIME + (SLOPE * (A_COEFF * exp(B_COEFF * ptrDimSequence[step].ticks) + C_COEFF));
                 if (R) {
-                    pc.printf("R\n");
+                    pc.putc('R');
+                    R = 0;
                 }
                 else if(Z) {
-                    pc.printf("Z\n");
-                }
-                if (R or Z) {
-                    pc.printf("C %i\n", dimmer_speed);                // send the new speed to the slaves so they can dim at the correct rate
-                    R = 0;
+                    pc.putc('Z');
                     Z = 0;
                 }
             }
@@ -524,30 +527,30 @@ int main() {
             /***************************************************** END SLAVE CHASE LOOP ********************************************************/
         }
         else {
-            vfnSlaveReceiveData(sequence);
-            
-            ptrDimSequence = ptrDimSeq;
-            sequenceLength = DimSeqLen;
-            
-            clocks = dimmer_speed;
-
-            int_ZCD.fall(&slave_zcross_isr);
-            
-            /********************************************************* SLAVE DIMMER LOOP ********************************************************/
             while(1) {
-                vfnGetLine();
+                vfnSlaveReceiveData(sequence);
                 
-                if(line[0] == 'R') {
-                    R = 1;
+                ptrDimSequence = ptrDimSeq;
+                sequenceLength = DimSeqLen;
+                
+                int_ZCD.fall(&slave_zcross_isr);
+                
+                /********************************************************* SLAVE DIMMER LOOP ********************************************************/
+                while(1) {
+                    command_char = pc.getc();
+                    if(command_char == 'R') {
+                        R = 1;
+                    }
+                    else if (command_char == 'Z') {
+                        Z = 1;
+                    }
+                    else if (command_char == 'L') {
+                        L = 1;
+                        break;
+                    }
                 }
-                else if (line[0] == 'Z') {
-                    Z = 1;
-                }
-                else if (line[0] == 'C') {
-                    sscanf(line, "%*s %i", &dimmer_speed);
-                }
+                /***************************************************** END SLAVE DIMMER LOOP ********************************************************/
             }
-            /***************************************************** END SLAVE DIMMER LOOP ********************************************************/
         }
     }
 }

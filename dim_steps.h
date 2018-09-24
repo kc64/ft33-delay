@@ -8,7 +8,8 @@ typedef struct {
 
 typedef struct {
     byte ticks;
-    sDimChanStep Chan[8];
+    byte delay;
+    sDimChanStep chan[8];
     } sDimStep;
 
 // sDimStep *ptrDimSequences[16];
